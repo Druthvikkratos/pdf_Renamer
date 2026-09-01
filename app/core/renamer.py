@@ -227,13 +227,13 @@ def find_doc_no_matches_in_content(text: str, records: dict) -> list:
     Cross-checks label-anchored candidates against known Excel Doc. Nos.
     Returns a sorted list of matches (ideally exactly one).
     """
-    candidates = extract_labelled_doc_numbers(text)
+    candidates = extract_all_numbers(text)
     return sorted(c for c in candidates if c in records)
 
 
 def _text_contains_doc_no(text: str, doc_no: str) -> bool:
     """Used only for the filename fast-path: is this doc_no actually present as a labelled number in the PDF?"""
-    return doc_no in extract_labelled_doc_numbers(text)
+    return doc_no in extract_all_numbers(text)
 
 
 def build_new_filename(record: dict, doc_no: str) -> str:
@@ -316,16 +316,17 @@ def process_files(excel_bytes: bytes, pdf_files: list):
                 failed_items.append((filename, content))
                 continue
             else:
-                labelled = extract_labelled_doc_numbers(text)
+                # labelled = extract_labelled_doc_numbers(text)
+                found_numbers = extract_all_numbers(text)
                 if filename_doc_no and filename_doc_no in records:
-                    reason = (f"Doc. No. '{filename_doc_no}' matched in Excel via filename, but could not be "
-                              f"verified against a labelled Invoice/Doc Number inside the PDF content.")
-                elif labelled:
-                    reason = (f"Found number(s) next to an Invoice/Doc Number label inside the PDF "
-                              f"({', '.join(sorted(labelled))}), but none of them exist in the Excel.")
+                    reason = (f"Doc. No. '{filename_doc_no}' matched in Excel via filename, but that number "
+                              f"was not found anywhere in the PDF content.")
+                elif found_numbers:
+                    reason = (f"Found number(s) inside the PDF ({', '.join(sorted(found_numbers))}), "
+                              f"but none of them exist in the Excel.")
                 elif filename_doc_no:
                     reason = (f"Doc. No. '{filename_doc_no}' from filename not found in Excel, and no "
-                              f"'Invoice Number'/'Doc Number'/'Document Number' label found inside the PDF.")
+                              f"'matching number found inside the PDF either.")
                 else:
                     reason = ("No 'Invoice Number' / 'Doc Number' / 'Document Number' label found inside the "
                               "PDF, and the filename didn't give a usable Doc. No. either.")
@@ -416,3 +417,10 @@ def extract_label_value_pairs(text: str) -> list:
             i += 1
 
     return pairs
+
+def extract_all_numbers(text: str) -> set:
+    """
+    Every run of digits found anywhere in the PDF text (length >= 4 to avoid
+    matching stray page numbers / single digits). No label check at all.
+    """
+    return set(re.findall(r"\d{4,}", text))

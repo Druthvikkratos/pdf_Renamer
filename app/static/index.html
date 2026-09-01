@@ -467,8 +467,23 @@ document.getElementById('unmatchedSearch').addEventListener('input', (e) => {
   renderUnmatchedTable(filtered);
 });
 
-function downloadZip(b64, filename) {
+async function downloadZip(b64, filename) {
   if (!b64) return;
+
+  // Running inside the desktop app (pywebview) - save via Python and open Explorer
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
+    try {
+      const result = await window.pywebview.api.save_file(b64, filename);
+      if (!result.ok) {
+        alert('Could not save file: ' + result.message);
+      }
+    } catch (err) {
+      alert('Download failed: ' + err);
+    }
+    return;
+  }
+
+  // Running in a normal browser (the website) - keep existing Blob download
   const url = b64ToBlobUrl(b64);
   const a = document.createElement('a');
   a.href = url;
