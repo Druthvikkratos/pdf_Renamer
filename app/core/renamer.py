@@ -328,8 +328,7 @@ def process_files(excel_bytes: bytes, pdf_files: list):
                     reason = (f"Doc. No. '{filename_doc_no}' from filename not found in Excel, and no "
                               f"'matching number found inside the PDF either.")
                 else:
-                    reason = ("No 'Invoice Number' / 'Doc Number' / 'Document Number' label found inside the "
-                              "PDF, and the filename didn't give a usable Doc. No. either.")
+                    reason = "No number matching an Excel Doc. No. was found inside the PDF."
                 result["failed"].append({"original": filename, "reason": reason})
                 failed_items.append((filename, content))
                 continue
