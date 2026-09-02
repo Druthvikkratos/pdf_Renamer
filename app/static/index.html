@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -192,6 +192,10 @@
   ul.warn-list { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
   .section-title { font-size: 14px; font-weight: 700; margin: 22px 0 10px; }
   .no-results { text-align: center; color: #9ca3af; padding: 16px; }
+  .progress-wrap { margin-top: 16px; }
+.progress-bar { width: 100%; height: 10px; background: var(--border); border-radius: 6px; overflow: hidden; }
+.progress-fill { height: 100%; width: 0%; background: var(--primary); transition: width 0.2s ease; }
+.progress-text { margin-top: 8px; font-size: 13px; color: var(--muted); text-align: center; }
 </style>
 </head>
 <body>
@@ -225,6 +229,10 @@
       </div>
     </div>
     <button class="primary" id="processBtn" disabled>Process Files</button>
+    <div class="progress-wrap hidden" id="progressWrap">
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+  <div class="progress-text" id="progressText">0 / 0</div>
+</div>
   </div>
 
   <div class="spinner" id="spinner">
@@ -288,9 +296,11 @@
 let excelFile = null;
 let pdfFiles = [];
 
-// Keep the raw result rows in memory so search can filter without re-fetching.
-let allResultRows = [];     // [{status: 'ok'|'no', original, detail}]
-let allUnmatchedRows = [];  // [{doc_no, document_type, customer, posting_date}]
+
+let allResultRows = [];     
+let allUnmatchedRows = [];
+let currentJobId = null;
+
 
 const excelZone = document.getElementById('excelZone');
 const pdfZone = document.getElementById('pdfZone');
@@ -338,6 +348,8 @@ function b64ToBlobUrl(b64) {
 
 processBtn.addEventListener('click', async () => {
   document.getElementById('resultsArea').classList.add('hidden');
+  document.getElementById('progressWrap').classList.remove('hidden');
+  document.getElementById('progressFill').style.width = '0%';
   document.getElementById('spinner').classList.add('active');
   processBtn.disabled = true;
 
@@ -346,16 +358,53 @@ processBtn.addEventListener('click', async () => {
   pdfFiles.forEach(f => formData.append('pdfs', f));
 
   try {
-    const res = await fetch('/api/process', { method: 'POST', body: formData });
-    const data = await res.json();
-    renderResults(data);
-  } catch (err) {
-    alert('Something went wrong while processing: ' + err);
-  } finally {
-    document.getElementById('spinner').classList.remove('active');
+  const startRes = await fetch('/api/process/start', { method: 'POST', body: formData });
+  const data = await startRes.json();
+
+  if (!data.job_id) {
+    alert('Could not start processing: ' + (data.error || 'unknown error'));
+    document.getElementById('progressWrap').classList.add('hidden');
     processBtn.disabled = false;
+    return;
   }
+
+  currentJobId = data.job_id;
+  pollStatus(data.job_id);
+} catch (err) {
+  alert('Could not start processing: ' + err);
+  document.getElementById('progressWrap').classList.add('hidden');
+  processBtn.disabled = false;
+}
 });
+
+function pollStatus(jobId) {
+  const interval = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/process/status/${jobId}`);
+      const status = await res.json();
+
+      const pct = status.total ? Math.round((status.processed / status.total) * 100) : 0;
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressText').textContent =
+        `${status.processed} / ${status.total}${status.current_filename ? ' — ' + status.current_filename : ''}`;
+
+      if (status.done) {
+        clearInterval(interval);
+        document.getElementById('progressWrap').classList.add('hidden');
+        processBtn.disabled = false;
+        if (status.error) {
+          alert('Processing failed: ' + status.error);
+          return;
+        }
+        renderResults(status.result, jobId);
+      }
+    } catch (err) {
+      clearInterval(interval);
+      alert('Lost connection while processing: ' + err);
+      processBtn.disabled = false;
+    }
+  }, 400);
+}
 
 function renderResults(data) {
   const area = document.getElementById('resultsArea');
@@ -383,12 +432,11 @@ function renderResults(data) {
 
   const dlSuccess = document.getElementById('downloadSuccess');
   const dlFailed = document.getElementById('downloadFailed');
-  dlSuccess.disabled = !data.success_zip_b64;
-  dlFailed.disabled = !data.failed_zip_b64;
-  dlSuccess.onclick = () => downloadZip(data.success_zip_b64, 'renamed_success.zip');
-  dlFailed.onclick = () => downloadZip(data.failed_zip_b64, 'failed_pdfs.zip');
+ dlSuccess.disabled = !data.has_success_zip;
+ dlFailed.disabled = !data.has_failed_zip;
+  dlSuccess.onclick = () => downloadZip(jobId, 'success', 'renamed_success.zip');
+   dlFailed.onclick = () => downloadZip(jobId, 'failed', 'failed_pdfs.zip');
 
-  // Build flat row lists once, then filter/render from these on every search keystroke.
   allResultRows = [
     ...(data.success || []).map(item => ({ status: 'ok', original: item.original, detail: item.renamed })),
     ...(data.failed || []).map(item => ({ status: 'no', original: item.original, detail: item.reason })),
@@ -467,33 +515,20 @@ document.getElementById('unmatchedSearch').addEventListener('input', (e) => {
   renderUnmatchedTable(filtered);
 });
 
-async function downloadZip(b64, filename) {
-  if (!b64) return;
-
-  // Running inside the desktop app (pywebview) - save via Python and open Explorer
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
-    try {
-      const result = await window.pywebview.api.save_file(b64, filename);
-      if (!result.ok) {
-        alert('Could not save file: ' + result.message);
-      }
-    } catch (err) {
-      alert('Download failed: ' + err);
-    }
+function downloadZip(jobId, kind, filename) {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_job_zip) {
+    window.pywebview.api.save_job_zip(jobId, kind, filename).then(result => {
+      if (!result.ok) alert('Could not save file: ' + result.message);
+    });
     return;
   }
-
-  // Running in a normal browser (the website) - keep existing Blob download
-  const url = b64ToBlobUrl(b64);
   const a = document.createElement('a');
-  a.href = url;
+  a.href = `/api/process/download/${jobId}/${kind}`;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(url);
 }
 
 document.getElementById('clearAllBtn').addEventListener('click', () => {
-  // Reset selected files
   excelFile = null;
   pdfFiles = [];
   excelInput.value = '';
@@ -502,7 +537,7 @@ document.getElementById('clearAllBtn').addEventListener('click', () => {
   pdfCount.textContent = '';
   updateButton();
 
-  // Reset results area completely
+
   allResultRows = [];
   allUnmatchedRows = [];
   document.getElementById('resultsArea').classList.add('hidden');
@@ -518,4 +553,916 @@ document.getElementById('clearAllBtn').addEventListener('click', () => {
 </script>
 
 </body>
+</html> -->
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Renamer</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%234f46e5'/%3E%3Ctext x='50' y='68' font-size='55' text-anchor='middle' fill='white' font-family='Arial'%3E%F0%9F%93%84%3C/text%3E%3C/svg%3E"
+    />
+    <style>
+      :root {
+        --bg: #f4f6fb;
+        --card: #ffffff;
+        --primary: #4f46e5;
+        --primary-dark: #3730a3;
+        --success: #16a34a;
+        --success-bg: #ecfdf5;
+        --danger: #dc2626;
+        --danger-bg: #fef2f2;
+        --warn: #d97706;
+        --warn-bg: #fffbeb;
+        --border: #e5e7eb;
+        --text: #1f2937;
+        --muted: #6b7280;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      header {
+        background: linear-gradient(
+          135deg,
+          var(--primary),
+          var(--primary-dark)
+        );
+        color: white;
+        padding: 22px 32px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      header .title h1 {
+        margin: 0;
+        font-size: 22px;
+      }
+      header .title p {
+        margin: 6px 0 0;
+        opacity: 0.85;
+        font-size: 14px;
+      }
+
+      button.clearAll {
+        background: rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+        color: white;
+        padding: 9px 16px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: 0.15s;
+        white-space: nowrap;
+      }
+      button.clearAll:hover {
+        background: rgba(255, 255, 255, 0.28);
+      }
+
+      .container {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px 20px 60px;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 22px;
+        margin-bottom: 20px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      }
+      .card h2 {
+        margin: 0 0 14px;
+        font-size: 16px;
+      }
+
+      .dropzones {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      @media (max-width: 700px) {
+        .dropzones {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .dropzone {
+        border: 2px dashed var(--border);
+        border-radius: 10px;
+        padding: 24px 14px;
+        text-align: center;
+        cursor: pointer;
+        transition: 0.15s;
+        background: #fafbff;
+      }
+      .dropzone:hover,
+      .dropzone.dragover {
+        border-color: var(--primary);
+        background: #f0f0fe;
+      }
+      .dropzone .icon {
+        font-size: 28px;
+        margin-bottom: 6px;
+      }
+      .dropzone .label {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .dropzone .sub {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+      .dropzone input {
+        display: none;
+      }
+      .file-count {
+        margin-top: 10px;
+        font-size: 13px;
+        color: var(--primary-dark);
+        font-weight: 600;
+      }
+
+      button.primary {
+        background: var(--primary);
+        color: white;
+        border: none;
+        padding: 12px 22px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        width: 100%;
+        margin-top: 18px;
+        transition: 0.15s;
+      }
+      button.primary:hover:not(:disabled) {
+        background: var(--primary-dark);
+      }
+      button.primary:disabled {
+        background: #c7c9f5;
+        cursor: not-allowed;
+      }
+
+      .btn-row {
+        display: flex;
+        gap: 12px;
+        margin-top: 14px;
+        flex-wrap: wrap;
+      }
+      button.download {
+        flex: 1;
+        min-width: 180px;
+        padding: 10px 16px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid var(--border);
+        background: white;
+        cursor: pointer;
+      }
+      button.download.success {
+        color: var(--success);
+        border-color: var(--success);
+      }
+      button.download.failed {
+        color: var(--danger);
+        border-color: var(--danger);
+      }
+      button.download:disabled {
+        color: #b0b3bb;
+        border-color: var(--border);
+        cursor: not-allowed;
+      }
+
+      .banner {
+        padding: 14px 16px;
+        border-radius: 8px;
+        font-size: 14px;
+        margin-bottom: 16px;
+      }
+      .banner.error {
+        background: var(--danger-bg);
+        color: var(--danger);
+        border: 1px solid #fecaca;
+      }
+      .banner.warn {
+        background: var(--warn-bg);
+        color: var(--warn);
+        border: 1px solid #fde68a;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+      @media (max-width: 700px) {
+        .stats {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      .stat {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px;
+        text-align: center;
+      }
+      .stat .num {
+        font-size: 22px;
+        font-weight: 700;
+      }
+      .stat .lbl {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 2px;
+      }
+      .stat.success .num {
+        color: var(--success);
+      }
+      .stat.danger .num {
+        color: var(--danger);
+      }
+
+      .search-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      .search-row input {
+        flex: 1;
+        padding: 9px 12px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font-size: 13px;
+        outline: none;
+      }
+      .search-row input:focus {
+        border-color: var(--primary);
+      }
+      .search-count {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 12px;
+        text-transform: uppercase;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-weight: 700;
+      }
+      .badge.ok {
+        background: var(--success-bg);
+        color: var(--success);
+      }
+      .badge.no {
+        background: var(--danger-bg);
+        color: var(--danger);
+      }
+      .table-wrap {
+        max-height: 320px;
+        overflow-y: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      .table-wrap table {
+        margin: 0;
+      }
+      .table-wrap th {
+        position: sticky;
+        top: 0;
+        background: white;
+      }
+
+      .hidden {
+        display: none;
+      }
+      ul.warn-list {
+        margin: 6px 0 0;
+        padding-left: 18px;
+        font-size: 13px;
+      }
+      .section-title {
+        font-size: 14px;
+        font-weight: 700;
+        margin: 22px 0 10px;
+      }
+      .no-results {
+        text-align: center;
+        color: #9ca3af;
+        padding: 16px;
+      }
+
+      .progress-wrap {
+        margin-top: 16px;
+      }
+      .progress-bar {
+        width: 100%;
+        height: 10px;
+        background: var(--border);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        width: 0%;
+        background: var(--primary);
+        transition: width 0.2s ease;
+      }
+      .progress-text {
+        margin-top: 8px;
+        font-size: 13px;
+        color: var(--muted);
+        text-align: center;
+      }
+      .progress-timer {
+        margin-top: 4px;
+        font-size: 12px;
+        color: var(--muted);
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .timing-bar {
+        display: flex;
+        justify-content: center;
+        gap: 24px;
+        flex-wrap: wrap;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 16px;
+        padding: 10px 14px;
+        background: #f8f9fd;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      .timing-bar b {
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <h1>📄 PDF Renamer</h1>
+        <p>
+          Upload the Excel + PDF batch from SAP → get correctly renamed PDFs,
+          sorted into Success / Failed zips.
+        </p>
+      </div>
+      <button class="clearAll" id="clearAllBtn">🗑 Clear All</button>
+    </header>
+
+    <div class="container">
+      <div class="card">
+        <h2>1. Upload files</h2>
+        <div class="dropzones">
+          <div class="dropzone" id="excelZone">
+            <div class="icon">📊</div>
+            <div class="label">Excel file</div>
+            <div class="sub">Click or drag a single .xlsx file</div>
+            <div class="file-count" id="excelCount"></div>
+            <input type="file" id="excelInput" accept=".xlsx,.xls" />
+          </div>
+          <div class="dropzone" id="pdfZone">
+            <div class="icon">🗂️</div>
+            <div class="label">PDF files</div>
+            <div class="sub">Click or drag multiple .pdf files</div>
+            <div class="file-count" id="pdfCount"></div>
+            <input type="file" id="pdfInput" accept=".pdf" multiple />
+          </div>
+        </div>
+        <button class="primary" id="processBtn" disabled>Process Files</button>
+
+        <div class="progress-wrap hidden" id="progressWrap">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div class="progress-text" id="progressText">0 / 0</div>
+          <div class="progress-timer" id="progressTimer">
+            Started at --:--:-- • Elapsed 0s
+          </div>
+        </div>
+      </div>
+
+      <div id="resultsArea" class="hidden">
+        <div class="timing-bar" id="timingBar"></div>
+
+        <div class="card" id="bannerCard" style="display: none"></div>
+
+        <div class="card">
+          <h2>2. Summary</h2>
+          <div class="stats">
+            <div class="stat">
+              <div class="num" id="statTotal">0</div>
+              <div class="lbl">Total PDFs</div>
+            </div>
+            <div class="stat success">
+              <div class="num" id="statSuccess">0</div>
+              <div class="lbl">Renamed OK</div>
+            </div>
+            <div class="stat danger">
+              <div class="num" id="statFailed">0</div>
+              <div class="lbl">Failed</div>
+            </div>
+            <div class="stat">
+              <div class="num" id="statExcelRows">0</div>
+              <div class="lbl">Excel Rows</div>
+            </div>
+            <div class="stat success">
+              <div class="num" id="statMatched">0</div>
+              <div class="lbl">Excel Rows Matched</div>
+            </div>
+            <div class="stat danger">
+              <div class="num" id="statUnmatched">0</div>
+              <div class="lbl">Excel Rows Unmatched</div>
+            </div>
+          </div>
+
+          <div class="btn-row">
+            <button class="download success" id="downloadSuccess" disabled>
+              ⬇ Download Success ZIP
+            </button>
+            <button class="download failed" id="downloadFailed" disabled>
+              ⬇ Download Failed ZIP
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-title">PDF results</div>
+          <div class="search-row">
+            <input
+              type="text"
+              id="resultsSearch"
+              placeholder="🔍 Search by filename, status, or reason..."
+            />
+            <span class="search-count" id="resultsSearchCount"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Original filename</th>
+                  <th>New name / Reason</th>
+                </tr>
+              </thead>
+              <tbody id="resultsTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" id="unmatchedCard" style="display: none">
+          <div class="section-title">
+            Excel rows with no matching PDF received
+          </div>
+          <div class="search-row">
+            <input
+              type="text"
+              id="unmatchedSearch"
+              placeholder="🔍 Search by Doc. No., Document Type, Customer, Date..."
+            />
+            <span class="search-count" id="unmatchedSearchCount"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Doc. No.</th>
+                  <th>Document Type</th>
+                  <th>Customer</th>
+                  <th>Posting Date</th>
+                </tr>
+              </thead>
+              <tbody id="unmatchedTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      let excelFile = null;
+      let pdfFiles = [];
+
+      // Keep the raw result rows in memory so search can filter without re-fetching.
+      let allResultRows = []; // [{status: 'ok'|'no', original, detail}]
+      let allUnmatchedRows = []; // [{doc_no, document_type, customer, posting_date}]
+      let currentJobId = null;
+
+      // Timing state
+      let startTime = null; // Date, when Process Files was clicked
+      let endTime = null; // Date, when job finished
+      let timerInterval = null;
+
+      const excelZone = document.getElementById("excelZone");
+      const pdfZone = document.getElementById("pdfZone");
+      const excelInput = document.getElementById("excelInput");
+      const pdfInput = document.getElementById("pdfInput");
+      const excelCount = document.getElementById("excelCount");
+      const pdfCount = document.getElementById("pdfCount");
+      const processBtn = document.getElementById("processBtn");
+
+      function setupDropzone(zone, input, onFiles) {
+        zone.addEventListener("click", () => input.click());
+        zone.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          zone.classList.add("dragover");
+        });
+        zone.addEventListener("dragleave", () =>
+          zone.classList.remove("dragover")
+        );
+        zone.addEventListener("drop", (e) => {
+          e.preventDefault();
+          zone.classList.remove("dragover");
+          onFiles(e.dataTransfer.files);
+        });
+        input.addEventListener("change", () => onFiles(input.files));
+      }
+
+      setupDropzone(excelZone, excelInput, (files) => {
+        if (files.length === 0) return;
+        excelFile = files[0];
+        excelCount.textContent = `✓ ${excelFile.name}`;
+        updateButton();
+      });
+
+      setupDropzone(pdfZone, pdfInput, (files) => {
+        pdfFiles = Array.from(files);
+        pdfCount.textContent = pdfFiles.length
+          ? `✓ ${pdfFiles.length} PDF file(s) selected`
+          : "";
+        updateButton();
+      });
+
+      function updateButton() {
+        processBtn.disabled = !(excelFile && pdfFiles.length > 0);
+      }
+
+      // ---- Timing helpers ----
+      function formatClock(date) {
+        return date.toLocaleTimeString([], { hour12: false });
+      }
+
+      function formatDuration(ms) {
+        const totalSec = Math.max(0, Math.round(ms / 1000));
+        const h = Math.floor(totalSec / 3600);
+        const m = Math.floor((totalSec % 3600) / 60);
+        const s = totalSec % 60;
+        if (h > 0) return `${h}h ${m}m ${s}s`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+      }
+
+      function tickTimer() {
+        if (!startTime) return;
+        const elapsedMs = Date.now() - startTime.getTime();
+        document.getElementById("progressTimer").textContent =
+          `Started at ${formatClock(startTime)} • Elapsed ${formatDuration(elapsedMs)}`;
+      }
+
+      processBtn.addEventListener("click", async () => {
+        document.getElementById("resultsArea").classList.add("hidden");
+        document.getElementById("progressWrap").classList.remove("hidden");
+        document.getElementById("progressFill").style.width = "0%";
+        document.getElementById("progressText").textContent =
+          `0 / ${pdfFiles.length}`;
+        processBtn.disabled = true;
+
+        startTime = new Date();
+        endTime = null;
+        tickTimer();
+        if (timerInterval) clearInterval(timerInterval);
+        timerInterval = setInterval(tickTimer, 1000);
+
+        const formData = new FormData();
+        formData.append("excel", excelFile);
+        pdfFiles.forEach((f) => formData.append("pdfs", f));
+
+        try {
+          const startRes = await fetch("/api/process/start", {
+            method: "POST",
+            body: formData
+          });
+          const data = await startRes.json();
+
+          if (!data.job_id) {
+            alert(
+              "Could not start processing: " + (data.error || "unknown error")
+            );
+            document.getElementById("progressWrap").classList.add("hidden");
+            processBtn.disabled = false;
+            clearInterval(timerInterval);
+            return;
+          }
+
+          currentJobId = data.job_id;
+          pollStatus(data.job_id);
+        } catch (err) {
+          alert("Could not start processing: " + err);
+          document.getElementById("progressWrap").classList.add("hidden");
+          processBtn.disabled = false;
+          clearInterval(timerInterval);
+        }
+      });
+
+      function pollStatus(jobId) {
+        const interval = setInterval(async () => {
+          try {
+            const res = await fetch(`/api/process/status/${jobId}`);
+            const status = await res.json();
+
+            const pct = status.total
+              ? Math.round((status.processed / status.total) * 100)
+              : 0;
+            document.getElementById("progressFill").style.width = pct + "%";
+            document.getElementById("progressText").textContent =
+              `${status.processed} / ${status.total}${status.current_filename ? " — " + status.current_filename : ""}`;
+
+            if (status.done) {
+              clearInterval(interval);
+              clearInterval(timerInterval);
+              endTime = new Date();
+
+              document.getElementById("progressWrap").classList.add("hidden");
+              processBtn.disabled = false;
+
+              if (status.error) {
+                alert("Processing failed: " + status.error);
+                return;
+              }
+              renderResults(status.result, jobId);
+            }
+          } catch (err) {
+            clearInterval(interval);
+            clearInterval(timerInterval);
+            alert("Lost connection while processing: " + err);
+            processBtn.disabled = false;
+          }
+        }, 400);
+      }
+
+      function renderTimingBar() {
+        const bar = document.getElementById("timingBar");
+        if (!startTime || !endTime) {
+          bar.innerHTML = "";
+          return;
+        }
+        const durationMs = endTime.getTime() - startTime.getTime();
+        bar.innerHTML = `
+    <span>Started: <b>${formatClock(startTime)}</b></span>
+    <span>Finished: <b>${formatClock(endTime)}</b></span>
+    <span>Duration: <b>${formatDuration(durationMs)}</b></span>
+  `;
+      }
+
+      function renderResults(data, jobId) {
+        const area = document.getElementById("resultsArea");
+        area.classList.remove("hidden");
+
+        renderTimingBar();
+
+        const bannerCard = document.getElementById("bannerCard");
+        bannerCard.style.display = "none";
+        bannerCard.innerHTML = "";
+
+        if (data.excel_error) {
+          bannerCard.style.display = "block";
+          bannerCard.innerHTML = `<div class="banner error"><strong>Excel error:</strong> ${data.excel_error}</div>`;
+        } else if (data.excel_warnings && data.excel_warnings.length) {
+          bannerCard.style.display = "block";
+          bannerCard.innerHTML = `<div class="banner warn"><strong>Warnings (${data.excel_warnings.length}):</strong>
+      <ul class="warn-list">${data.excel_warnings
+        .slice(0, 20)
+        .map((w) => `<li>${w}</li>`)
+        .join("")}</ul></div>`;
+        }
+
+        document.getElementById("statTotal").textContent = data.total_pdfs ?? 0;
+        document.getElementById("statSuccess").textContent =
+          data.success?.length ?? 0;
+        document.getElementById("statFailed").textContent =
+          data.failed?.length ?? 0;
+        document.getElementById("statExcelRows").textContent =
+          data.excel_total_rows ?? 0;
+        document.getElementById("statMatched").textContent =
+          data.excel_matched_count ?? 0;
+        document.getElementById("statUnmatched").textContent =
+          data.excel_unmatched?.length ?? 0;
+
+        const dlSuccess = document.getElementById("downloadSuccess");
+        const dlFailed = document.getElementById("downloadFailed");
+        dlSuccess.disabled = !data.has_success_zip;
+        dlFailed.disabled = !data.has_failed_zip;
+        dlSuccess.onclick = () =>
+          downloadZip(jobId, "success", "renamed_success.zip");
+        dlFailed.onclick = () =>
+          downloadZip(jobId, "failed", "failed_pdfs.zip");
+
+        // Build flat row lists once, then filter/render from these on every search keystroke.
+        allResultRows = [
+          ...(data.success || []).map((item) => ({
+            status: "ok",
+            original: item.original,
+            detail: item.renamed
+          })),
+          ...(data.failed || []).map((item) => ({
+            status: "no",
+            original: item.original,
+            detail: item.reason
+          }))
+        ];
+        allUnmatchedRows = data.excel_unmatched || [];
+
+        document.getElementById("resultsSearch").value = "";
+        document.getElementById("unmatchedSearch").value = "";
+
+        renderResultsTable(allResultRows);
+        renderUnmatchedTable(allUnmatchedRows);
+
+        const unmatchedCard = document.getElementById("unmatchedCard");
+        unmatchedCard.style.display = allUnmatchedRows.length
+          ? "block"
+          : "none";
+      }
+
+      function renderResultsTable(rows) {
+        const table = document.getElementById("resultsTable");
+        const countLbl = document.getElementById("resultsSearchCount");
+        countLbl.textContent = `${rows.length} of ${allResultRows.length} shown`;
+
+        if (!rows.length) {
+          table.innerHTML = `<tr><td colspan="3" class="no-results">No matching results.</td></tr>`;
+          return;
+        }
+        table.innerHTML = rows
+          .map(
+            (r) => `
+    <tr>
+      <td><span class="badge ${r.status === "ok" ? "ok" : "no"}">${r.status === "ok" ? "SUCCESS" : "FAILED"}</span></td>
+      <td>${escapeHtml(r.original)}</td>
+      <td>${escapeHtml(r.detail)}</td>
+    </tr>`
+          )
+          .join("");
+      }
+
+      function renderUnmatchedTable(rows) {
+        const table = document.getElementById("unmatchedTable");
+        const countLbl = document.getElementById("unmatchedSearchCount");
+        countLbl.textContent = `${rows.length} of ${allUnmatchedRows.length} shown`;
+
+        if (!rows.length) {
+          table.innerHTML = `<tr><td colspan="4" class="no-results">No matching rows.</td></tr>`;
+          return;
+        }
+        table.innerHTML = rows
+          .map(
+            (r) => `
+    <tr>
+      <td>${escapeHtml(r.doc_no)}</td>
+      <td>${escapeHtml(r.document_type)}</td>
+      <td>${escapeHtml(r.customer)}</td>
+      <td>${escapeHtml(r.posting_date)}</td>
+    </tr>`
+          )
+          .join("");
+      }
+
+      function escapeHtml(v) {
+        return String(v ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;"
+            })[c]
+        );
+      }
+
+      document
+        .getElementById("resultsSearch")
+        .addEventListener("input", (e) => {
+          const q = e.target.value.trim().toLowerCase();
+          const filtered = !q
+            ? allResultRows
+            : allResultRows.filter(
+                (r) =>
+                  r.original.toLowerCase().includes(q) ||
+                  r.detail.toLowerCase().includes(q) ||
+                  (r.status === "ok" ? "success" : "failed").includes(q)
+              );
+          renderResultsTable(filtered);
+        });
+
+      document
+        .getElementById("unmatchedSearch")
+        .addEventListener("input", (e) => {
+          const q = e.target.value.trim().toLowerCase();
+          const filtered = !q
+            ? allUnmatchedRows
+            : allUnmatchedRows.filter(
+                (r) =>
+                  String(r.doc_no).toLowerCase().includes(q) ||
+                  String(r.document_type).toLowerCase().includes(q) ||
+                  String(r.customer).toLowerCase().includes(q) ||
+                  String(r.posting_date).toLowerCase().includes(q)
+              );
+          renderUnmatchedTable(filtered);
+        });
+
+      function downloadZip(jobId, kind, filename) {
+        if (
+          window.pywebview &&
+          window.pywebview.api &&
+          window.pywebview.api.save_job_zip
+        ) {
+          window.pywebview.api
+            .save_job_zip(jobId, kind, filename)
+            .then((result) => {
+              if (!result.ok) alert("Could not save file: " + result.message);
+            });
+          return;
+        }
+        const a = document.createElement("a");
+        a.href = `/api/process/download/${jobId}/${kind}`;
+        a.download = filename;
+        a.click();
+      }
+
+      document.getElementById("clearAllBtn").addEventListener("click", () => {
+        // Reset selected files
+        excelFile = null;
+        pdfFiles = [];
+        excelInput.value = "";
+        pdfInput.value = "";
+        excelCount.textContent = "";
+        pdfCount.textContent = "";
+        updateButton();
+
+        // Reset timing state
+        startTime = null;
+        endTime = null;
+        if (timerInterval) clearInterval(timerInterval);
+        document.getElementById("timingBar").innerHTML = "";
+
+        // Reset results area completely
+        allResultRows = [];
+        allUnmatchedRows = [];
+        currentJobId = null;
+        document.getElementById("resultsArea").classList.add("hidden");
+        document.getElementById("progressWrap").classList.add("hidden");
+        document.getElementById("bannerCard").style.display = "none";
+        document.getElementById("bannerCard").innerHTML = "";
+        document.getElementById("resultsSearch").value = "";
+        document.getElementById("unmatchedSearch").value = "";
+        document.getElementById("resultsTable").innerHTML = "";
+        document.getElementById("unmatchedTable").innerHTML = "";
+        document.getElementById("downloadSuccess").disabled = true;
+        document.getElementById("downloadFailed").disabled = true;
+      });
+    </script>
+  </body>
 </html>

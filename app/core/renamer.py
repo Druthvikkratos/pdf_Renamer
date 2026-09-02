@@ -237,7 +237,8 @@ def _text_contains_doc_no(text: str, doc_no: str) -> bool:
 
 
 def build_new_filename(record: dict, doc_no: str) -> str:
-    return f"{record['document_type']}_{doc_no}-{record['customer']}-{record['posting_date']}.pdf"
+    today_str = datetime.now().strftime("%Y_%m_%d")
+    return f"{record['document_type']}_{doc_no}-{record['customer']}-{record['posting_date']}_{today_str}.pdf"
 
 
 # =============================================================================
